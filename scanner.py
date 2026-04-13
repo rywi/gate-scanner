@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MotoSport Gate Scanner v2 \u2014 USB QR/Barcode reader
+MotoSport Gate Scanner v2 — USB QR/Barcode reader
 Reads QR codes from USB HID scanner, validates via Cloud Function.
 Full-screen terminal UI with color feedback + file logging.
 """
@@ -12,11 +12,13 @@ import select
 import signal
 import logging
 import threading
+import tty
+import termios
 from datetime import datetime
 import requests
 from urllib.parse import urlparse, parse_qs
 
-# \u2500\u2500 Config \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Config ──────────────────────────────────────────────────────────────────
 GATE_ENDPOINT = "https://europe-west1-moto-862a0.cloudfunctions.net/validateGatePass"
 DEVICE_ID = os.environ.get("DEVICE_ID", "yoga-gate-1")
 GATE_ID = os.environ.get("GATE_ID", "gate-main")
@@ -24,7 +26,7 @@ RESET_DELAY = float(os.environ.get("RESET_DELAY", "3"))
 DEBUG = os.environ.get("DEBUG", "1") == "1"  # default ON
 DEDUP_SECONDS = float(os.environ.get("DEDUP_SECONDS", "5"))  # ignore same code within N seconds
 
-# \u2500\u2500 Logging to file \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Logging to file ─────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(SCRIPT_DIR, "scanner.log")
 
@@ -37,7 +39,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("gate")
 
-# \u2500\u2500 ANSI colors \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── ANSI colors ─────────────────────────────────────────────────────────────
 RST = "\033[0m"
 BOLD = "\033[1m"
 GREEN_BG = "\033[42;97;1m"
@@ -195,7 +197,6 @@ DENY_MESSAGES = {
 
 def flush_stdin():
     """Discard any buffered stdin input (from rapid scanning during processing)."""
-    import termios
     try:
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
         log.debug("Flushed stdin buffer")
@@ -209,13 +210,45 @@ def flush_stdin():
             pass
 
 
+INPUT_TIMEOUT = 1.0  # seconds to wait for newline after first char
+
+
+def read_scanner_input() -> str:
+    """Read input from USB HID scanner with timeout.
+    
+    Handles scanners that may not send newline after sleep/wake.
+    Collects chars until newline OR until INPUT_TIMEOUT after last char.
+    """
+    buf = []
+    while True:
+        # Wait for first character (block indefinitely)
+        if not buf:
+            ready = select.select([sys.stdin], [], [])
+        else:
+            # After first char, wait up to INPUT_TIMEOUT for more
+            ready = select.select([sys.stdin], [], [], INPUT_TIMEOUT)
+
+        if ready[0]:
+            ch = sys.stdin.read(1)
+            if ch == '\n' or ch == '\r':
+                if buf:
+                    return ''.join(buf)
+                # Empty line, keep waiting
+                continue
+            buf.append(ch)
+        else:
+            # Timeout \u2014 return what we have
+            if buf:
+                line = ''.join(buf)
+                log.info(f"Input collected via timeout (no newline) \u2014 {len(line)} chars")
+                return line
+
+
 def main():
     scan_count = 0
     last_pass_id = None
     last_scan_time = 0.0
     processing = threading.Lock()
-
-    signal.signal(signal.SIGINT, lambda *_: (log.info(f"Shutdown \u2014 {scan_count} scans total"), print(f"\n{RST}Bye!"), sys.exit(0)))
 
     log.info("=" * 60)
     log.info(f"STARTUP \u2014 device={DEVICE_ID} gate={GATE_ID} debug={DEBUG}")
@@ -223,7 +256,7 @@ def main():
     log.info(f"Reset delay: {RESET_DELAY}s, Dedup: {DEDUP_SECONDS}s")
 
     # \u2500\u2500 Startup info (visible before fullscreen) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    print(f"{BOLD}MotoSport Gate Scanner v2{RST}")
+    print(f"{BOLD}MotoSport Gate Scanner v4{RST}")
     print(f"{'\u2500' * 40}")
     print(f"Endpoint: {GATE_ENDPOINT}")
     print(f"Device:   {DEVICE_ID}")
@@ -255,10 +288,22 @@ def main():
     time.sleep(2)
     show_idle(scan_count)
 
-    while True:
+    # Set stdin to unbuffered for char-by-char reading
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+
+    def cleanup(*_):
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        log.info(f"Shutdown \u2014 {scan_count} scans total")
+        print(f"\n{RST}Bye!")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+
+    try:
+      while True:
         try:
-            # USB HID scanner sends text + Enter = readline
-            qr_data = input()
+            qr_data = read_scanner_input()
         except EOFError:
             log.info("EOF \u2014 exiting")
             break
@@ -322,6 +367,8 @@ def main():
 
         finally:
             processing.release()
+    finally:
+      termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
 if __name__ == "__main__":
